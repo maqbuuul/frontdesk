@@ -1,5 +1,6 @@
 import type Anthropic from '@anthropic-ai/sdk';
 import { runTurn } from '@/lib/agent/run';
+import { runDemoTurn } from '@/lib/agent/demo';
 import { sql } from '@/lib/db';
 import { fail, ok, readJson, SAY } from '@/lib/tool-response';
 
@@ -47,15 +48,25 @@ export async function POST(req: Request) {
   }
 
   try {
-    const turn = await runTurn({
-      baseUrl: origin,
-      callId,
-      transport,
-      fromPhone,
-      history,
-      userMessage: message,
-      openNow: withinBusinessHours(),
-    });
+    const demoMode = !process.env.ANTHROPIC_API_KEY;
+    const turn = demoMode
+      ? await runDemoTurn({
+          baseUrl: origin,
+          callId,
+          transport,
+          fromPhone,
+          userMessage: message,
+          locationId,
+        })
+      : await runTurn({
+          baseUrl: origin,
+          callId,
+          transport,
+          fromPhone,
+          history,
+          userMessage: message,
+          openNow: withinBusinessHours(),
+        });
 
     const nextHistory: Anthropic.Beta.BetaMessageParam[] = [
       ...history,
@@ -76,6 +87,7 @@ export async function POST(req: Request) {
       outcome: turn.outcome,
       appointmentId: turn.appointmentId ?? null,
       toolCalls: turn.toolCalls,
+      mode: !process.env.ANTHROPIC_API_KEY ? 'demo-rule-based' : 'claude',
     });
   } catch (err) {
     console.error('agent turn failed', err);
