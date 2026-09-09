@@ -1,0 +1,183 @@
+{
+  "name": "01 - Missed call rescue",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "missed-call",
+        "responseMode": "onReceived",
+        "responseData": "noData",
+        "options": {}
+      },
+      "id": "hook-missed-0001",
+      "name": "Missed call (GHL)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// A missed call becomes a text conversation within seconds, and the\n// appointment gets recovered instead of lost to whoever the caller rings next.\n//\n// GHL webhook payloads are not stable enough to trust field names, so this\n// reads defensively: several candidate shapes for each fact, never failing\n// the run because a webhook arrived nested differently than last week.\n\nconst body = $input.first().json;\nconst flat = (v) => (typeof v === 'object' && v !== null ? v : {});\nconst str = (v) => (v === undefined || v === null ? '' : String(v).trim());\n\nconst call = flat(body.call);\nconst contact = flat(body.contact);\nconst location = flat(body.location);\n\nconst rawPhone = str(body.phone || body.from || body.fromNumber || body.callerNumber ||\n  call.phone || call.from || contact.phone || contact.mobilePhone || '');\nconst phone = rawPhone.replace(/[^+0-9]/g, '');\nconst contact_id = str(body.contactId || body.contact_id || contact.id || contact.contactId);\nconst location_id = str(body.locationId || body.location_id || location.id || location.locationId);\nconst call_ref = str(body.callId || body.call_id || body.id || call.id || '');\nconst tags = Array.isArray(contact.tags) ? contact.tags.map(str) : [];\n\nreturn [{\n  json: {\n    phone,\n    contact_id,\n    location_id,\n    call_ref,\n    tags,\n    raw_phone: rawPhone,\n    received_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "parse-0002",
+      "name": "Parse the webhook",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1020, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-phone",
+              "leftValue": "={{ $json.phone }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-phone-0003",
+      "name": "Rescuable call?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-800, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Steps 2-4 of the spec are most of the workflow: sending the message is\n-- the easy part, not sending it at the wrong moment is the work.\n--\n-- open_calls:      is this contact already in an open conversation? Two bots\n--                  texting one person is worse than not texting them at all.\n-- inbound_today:   proxy for the per-contact per-day rescue rate limit, and\n--                  the only counter that exists until the messaging transport\n--                  lands.\n-- timezone:        the location's own clock decides quiet hours, not the\n--                  workflow server's.\nSELECT\n  (SELECT count(*) FROM calls c\n    WHERE c.from_phone = $1 AND c.ended_at IS NULL)                          AS open_calls,\n  (SELECT count(*) FROM calls c\n    WHERE c.from_phone = $1\n      AND c.started_at::date = (now() AT TIME ZONE COALESCE(l.timezone, $2))::date)\n                                                                             AS inbound_today,\n  COALESCE(l.timezone, $2)                                                   AS timezone,\n  COALESCE(l.business_name, '')                                             AS business_name,\n  COALESCE(l.business_hours::text, '{}')                                    AS business_hours\nFROM (SELECT 1) x\nLEFT JOIN locations l ON l.active AND l.location_id = $3;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify([$json.phone, $env.LOCATION_TIMEZONE || 'America/New_York', $json.location_id || '']) }}"
+        }
+      },
+      "id": "ctx-0004",
+      "name": "Conversation + rate context",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [-580, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// The decision, in one place, so the execution log reads like a policy\n// rather than a coincidence of node wiring.\n//\n// Order matters: the most permanent reasons (already talking to this person)\n// are checked before the transient ones (it is 9pm).\n//\n// Tuning knobs live here as literals matching the workflow README defaults:\n//   quiet hours               20:00-08:00  (QUIET_HOURS_START / QUIET_HOURS_END)\n//   max rescues per contact  1            (MAX_RESCUE_PER_CONTACT_PER_DAY)\n// Change them here if this n8n instance sets different values.\n\nconst ctx = $input.first().json;\nconst parsed = $('Parse the webhook').first().json;\n\nconst MAX_PER_DAY = 1;\nconst quietStart = 20 * 60;         // 20:00, location time\nconst quietEnd = 8 * 60;            // 08:00, location time\nconst tz = ctx.timezone || 'America/New_York';\n\nconst now = new Date();\nconst parts = new Intl.DateTimeFormat('en-GB', {\n  timeZone: tz, hour: 'numeric', minute: 'numeric', hour12: false\n}).formatToParts(now);\nconst hour = Number(parts.find(p => p.type === 'hour').value);\nconst minute = Number(parts.find(p => p.type === 'minute').value);\nconst mins = hour * 60 + minute;\nconst inQuietHours = quietEnd > quietStart\n  ? mins >= quietStart && mins < quietEnd\n  : mins >= quietStart || mins < quietEnd;\n\nconst OPT_OUT_TAGS = ['do-not-contact', 'no-texts', 'opt-out'];\nconst optedOut = parsed.tags.some(t => OPT_OUT_TAGS.includes(String(t).toLowerCase()));\n\nlet should_send = true;\nlet reason = '';\nif (Number(ctx.open_calls) > 0) { should_send = false; reason = 'already in an open conversation'; }\nelse if (inQuietHours) { should_send = false; reason = 'quiet hours (' + tz + ')'; }\nelse if (optedOut) { should_send = false; reason = 'contact opted out of texts'; }\nelse if (Number(ctx.inbound_today) >= MAX_PER_DAY) { should_send = false; reason = 'daily rescue limit reached for this contact'; }\n\nreturn [{\n  json: {\n    should_send,\n    reason,\n    phone: parsed.phone,\n    contact_id: parsed.contact_id,\n    location_id: parsed.location_id,\n    call_ref: parsed.call_ref,\n    business_name: ctx.business_name,\n    timezone: tz,\n    in_quiet_hours: inQuietHours,\n    open_calls: Number(ctx.open_calls),\n    inbound_today: Number(ctx.inbound_today),\n    opted_out: optedOut\n  }\n}];"
+      },
+      "id": "rules-0005",
+      "name": "Quiet hours · dedupe · rate · opt-out",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-360, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "should-send",
+              "leftValue": "={{ $json.should_send }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-send-0006",
+      "name": "Send the rescue?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-140, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.RESCUE_AGENT_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ phone: $json.phone, contactId: $json.contact_id, locationId: $json.location_id, channel: 'sms', reason: 'missed_call_rescue' }) }}",
+        "options": {}
+      },
+      "id": "send-0007",
+      "name": "Open the agent thread",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [100, 300]
+    },
+    {
+      "parameters": {},
+      "id": "noop-standdown-0008",
+      "name": "Stand down (logged above)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [100, 460]
+    },
+    {
+      "parameters": {},
+      "id": "noop-unrescuable-0009",
+      "name": "No number to call back",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [-800, 460]
+    }
+  ],
+  "connections": {
+    "Missed call (GHL)": {
+      "main": [[{ "node": "Parse the webhook", "type": "main", "index": 0 }]]
+    },
+    "Parse the webhook": {
+      "main": [[{ "node": "Rescuable call?", "type": "main", "index": 0 }]]
+    },
+    "Rescuable call?": {
+      "main": [
+        [{ "node": "Conversation + rate context", "type": "main", "index": 0 }],
+        [{ "node": "No number to call back", "type": "main", "index": 0 }]
+      ]
+    },
+    "Conversation + rate context": {
+      "main": [[{ "node": "Quiet hours · dedupe · rate · opt-out", "type": "main", "index": 0 }]]
+    },
+    "Quiet hours · dedupe · rate · opt-out": {
+      "main": [[{ "node": "Send the rescue?", "type": "main", "index": 0 }]]
+    },
+    "Send the rescue?": {
+      "main": [
+        [{ "node": "Open the agent thread", "type": "main", "index": 0 }],
+        [{ "node": "Stand down (logged above)", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

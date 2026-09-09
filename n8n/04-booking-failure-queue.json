@@ -1,0 +1,202 @@
+{
+  "name": "04 - Booking failure queue",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "booking-failure",
+        "responseMode": "onReceived",
+        "responseData": "noData",
+        "options": {}
+      },
+      "id": "hook-bfail-0001",
+      "name": "Booking failure (internal)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1360, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// A booking the caller believes they have and the clinic has never heard of\n// is the most damaging failure this system can produce, so it gets its own\n// workflow rather than a catch block.\n//\n// Envelope contract (fire-and-forget POST from the book_appointment tool's\n// failure paths): { callId?, phone, locationId?, code, retryable,\n// agentShouldSay, offeredSlotId? }\n\nconst body = $input.first().json;\nconst str = (v) => (v === undefined || v === null ? '' : String(v).trim());\n\nconst phone = str(body.phone || body.from_phone || '').replace(/[^+0-9]/g, '');\nconst location_id = str(body.locationId || body.location_id);\n\nreturn [{\n  json: {\n    call_id: str(body.callId || body.call_id),\n    phone,\n    has_phone: phone.length >= 7,\n    location_id: location_id || null,\n    code: str(body.code || 'booking_failed'),\n    retryable: body.retryable === true || body.retryable === 'true',\n    agent_should_say: str(body.agentShouldSay || body.agent_should_say),\n    slot_id: str(body.offeredSlotId || body.slot_id),\n    raw_code: str(body.reason || body.error || '')\n  }\n}];"
+      },
+      "id": "norm-0002",
+      "name": "Normalise the failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1140, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "retryable",
+              "leftValue": "={{ $json.retryable }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-retry-0003",
+      "name": "Retry the transient case?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-920, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.BOOKING_RETRY_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ callId: $json.call_id, phone: $json.phone, slotId: $json.slot_id, code: $json.code }) }}",
+        "options": {}
+      },
+      "id": "retry-0004",
+      "name": "Retry the booking",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-700, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-phone",
+              "leftValue": "={{ $json.has_phone }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-alert-0005",
+      "name": "A human to alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-700, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- messages.location_id is a foreign key. The failure payload usually\n-- carries the real location; when it does not, the call row (or the failure\n-- itself) is the only handle, so fall back to the default location from the\n-- instance environment before giving up on a placeholder.\nINSERT INTO locations (location_id, business_name, timezone, calendar_id)\nVALUES ($1, 'Unknown practice (booking failure)', 'America/New_York', '')\nON CONFLICT (location_id) DO NOTHING;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify([$json.location_id || $env.DEFAULT_LOCATION_ID || 'booking-failure']) }}"
+        }
+      },
+      "id": "loc-0006",
+      "name": "Ensure the location row",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [-480, 400],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The front desk queue (messages) is where a human will actually see it;\n-- Slack is the noisy nudge. The summary carries everything needed to call\n-- the patient back without opening the console.\nINSERT INTO messages (call_id, location_id, contact_phone, contact_name, summary, callback_window)\nVALUES (NULLIF($1, ''), $2, $3, NULL, $4, 'asap');",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify([$json.call_id, $json.location_id || $env.DEFAULT_LOCATION_ID || 'booking-failure', $json.phone, 'BOOKING FAILED (' + $json.code + ') for caller ' + $json.phone + ($json.agent_should_say ? '. Caller was told: ' + $json.agent_should_say : '')]) }}"
+        }
+      },
+      "id": "queue-0007",
+      "name": "Queue for the front desk",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [-260, 400],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':rotating_light: *Booking failed* — caller believes they are booked.\\n• Number: ' + $json.phone + '\\n• Code: ' + $json.code + '\\n• Retryable: ' + $json.retryable + ($json.agent_should_say ? '\\n• Caller was told: ' + $json.agent_should_say : '') }) }}",
+        "options": {}
+      },
+      "id": "slack-0008",
+      "name": "Alert a human",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-40, 400]
+    },
+    {
+      "parameters": {},
+      "id": "noop-quiet-0009",
+      "name": "Nothing to alert on",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [-480, 560]
+    }
+  ],
+  "connections": {
+    "Booking failure (internal)": {
+      "main": [[{ "node": "Normalise the failure", "type": "main", "index": 0 }]]
+    },
+    "Normalise the failure": {
+      "main": [[{ "node": "Retry the transient case?", "type": "main", "index": 0 }]]
+    },
+    "Retry the transient case?": {
+      "main": [
+        [{ "node": "Retry the booking", "type": "main", "index": 0 }],
+        [{ "node": "A human to alert?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Retry the booking": {
+      "main": [[{ "node": "A human to alert?", "type": "main", "index": 0 }]]
+    },
+    "A human to alert?": {
+      "main": [
+        [{ "node": "Ensure the location row", "type": "main", "index": 0 }],
+        [{ "node": "Nothing to alert on", "type": "main", "index": 0 }]
+      ]
+    },
+    "Ensure the location row": {
+      "main": [[{ "node": "Queue for the front desk", "type": "main", "index": 0 }]]
+    },
+    "Queue for the front desk": {
+      "main": [[{ "node": "Alert a human", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

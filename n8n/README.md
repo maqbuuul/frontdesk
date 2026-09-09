@@ -10,6 +10,25 @@ retries and visibility are worth the latency they cost.
 If you find yourself putting an n8n webhook between the caller and the calendar,
 that's the signal you've drawn the line in the wrong place.
 
+## Import
+
+Each workflow below ships as an importable export in this folder
+(`01-missed-call-rescue.json` … `05-nightly-reconciliation.json`), built
+against a stock n8n with the same conventions as the pay-per-show workflows:
+no custom credentials beyond one Postgres credential named **Postgres account**,
+and everything external (calendar, Slack, SMS, agent) addressed through
+instance environment variables, never hard-coded.
+
+Import order does not matter — none of them depend on another workflow's data.
+Webhook paths (`missed-call`, `post-call`, `escalation`, `booking-failure`)
+are relative; the production URL is `<your-n8n>/webhook/<path>`.
+
+**Two envelopes are documented but not yet fired from the app code.** The
+escalation router's webhook is live (the `escalate` tool POSTs to
+`N8N_ESCALATION_WEBHOOK_URL`). The booking-failure and post-call webhooks
+become live when the transports land and the tool layer is wired to them —
+see `DEPLOYMENT.md` in the repo root.
+
 ---
 
 ## `01-missed-call-rescue`
@@ -93,6 +112,8 @@ can tell you, and burying it makes every other number less trustworthy.
 
 ## Environment
 
+Instance-wide environment variables (Settings → Environment variables):
+
 ```
 DATABASE_URL
 GHL_API_TOKEN
@@ -104,6 +125,38 @@ QUIET_HOURS_START              default 20:00
 QUIET_HOURS_END                default 08:00
 MAX_RESCUE_PER_CONTACT_PER_DAY default 1
 ```
+
+Environment variables specific to the exports:
+
+```
+# 01 — where a rescue opens the agent thread (transport endpoint).
+#      Until the WhatsApp/SMS transport lands this is unset and the run
+#      simply ends at "Open the agent thread".
+RESCUE_AGENT_URL
+
+# 02 — the model that extracts intent/outcome from the transcript.
+#      Defaults to claude-sonnet-4-5 when unset.
+POSTCALL_MODEL
+
+# 03 — generic SMS gateway for the after-hours on-call alert.
+ONCALL_SMS_URL
+
+# 04 — retry endpoint for transient booking failures.
+BOOKING_RETRY_URL
+
+# 05 — the calendar that owns appointments (CALENDAR_PROVIDER's API),
+#      same shape the pay-per-show workflows expect. Without it the nightly
+#      sync errors loudly rather than pretending to have synced.
+CALENDAR_API_URL
+CALENDAR_API_KEY
+
+# 02/04/05 — the location rows they upsert into when a payload omits one.
+DEFAULT_LOCATION_ID
+```
+
+The quiet-hours and rate-limit values used by `01` are literals in the "Quiet
+hours · dedupe · rate · opt-out" Code node, matching the defaults above;
+change them there if this instance sets different values.
 
 ## Conventions
 

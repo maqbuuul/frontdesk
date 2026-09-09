@@ -1,0 +1,220 @@
+{
+  "name": "05 - Nightly reconciliation",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * *"
+            }
+          ]
+        }
+      },
+      "id": "trg-nightly-0001",
+      "name": "2am nightly",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-1640, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- appointments.location_id is a foreign key; the location row is ensured\n-- once here so the nightly sync below can insert human-booked appointments\n-- it has never seen before.\nINSERT INTO locations (location_id, business_name, timezone, calendar_id)\nVALUES ($1, 'Bright Smile Dental', 'America/New_York', '')\nON CONFLICT (location_id) DO NOTHING;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify([$env.DEFAULT_LOCATION_ID || 'demo-location']) }}"
+        }
+      },
+      "id": "loc-0002",
+      "name": "Ensure the location row",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [-1420, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The calendar API does not know who booked what. The database does, for\n-- agent bookings (call_id is set). Everything else in the window is treated\n-- as human-booked -- that is the whole point of the comparison, and the\n-- reason 'booked_by' is a column and not a guess.\nSELECT appointment_id\nFROM appointments\nWHERE booked_by = 'agent';",
+        "options": {}
+      },
+      "id": "agent-0003",
+      "name": "Agent-booked appointment ids",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [-1200, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.CALENDAR_API_URL }}/bookings",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "afterStart", "value": "={{ new Date(Date.now() - 45 * 86400000).toISOString() }}" },
+            { "name": "beforeEnd", "value": "={{ new Date().toISOString() }}" }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.CALENDAR_API_KEY }}" }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "fetch-0004",
+      "name": "Fetch calendar bookings",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-980, 300],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full refresh over a trailing window rather than incremental. Attendance\n// gets corrected days after the fact, and a window wide enough to pick that\n// up beats an incremental sync that quietly misses it.\n\nconst body = $input.first().json;\nconst agentRows = $('Agent-booked appointment ids').all();\nconst agentIds = new Set(agentRows.map(r => String(r.json.appointment_id)));\n\nconst bookings = Array.isArray(body) ? body : (body.bookings || body.data || []);\nif (!Array.isArray(bookings)) {\n  return [{ json: { rows: [], fetched: 0, error: 'unreadable calendar response' } }];\n}\n\nconst STATUS = {\n  accepted: 'booked',\n  pending: 'booked',\n  confirmed: 'confirmed',\n  attended: 'attended',\n  completed: 'attended',\n  noshow: 'no_show',\n  no_show: 'no_show',\n  cancelled: 'cancelled',\n  rejected: 'cancelled'\n};\n\nconst rows = bookings.map(b => {\n  const raw = String(b.status || b.outcome || '').toLowerCase().replace(/[^a-z_]/g, '');\n  const starts = b.startTime || b.start || b.starts_at;\n  const id = String(b.uid || b.id || '');\n  if (!id || !starts) return null;\n  const past = new Date(starts) < new Date();\n  return {\n    appointment_id: id,\n    booked_at: b.createdAt || b.booked_at || starts,\n    starts_at: starts,\n    status: STATUS[raw] || (past ? 'booked' : 'booked'),\n    status_at: b.updatedAt || b.updated_at || null,\n    booked_by: agentIds.has(id) ? 'agent' : 'human'\n  };\n}).filter(Boolean);\n\nreturn [{ json: { rows, fetched: bookings.length } }];"
+      },
+      "id": "merge-0005",
+      "name": "Merge and map statuses",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-760, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Idempotent on appointment_id: the same window is re-fetched nightly.\n-- The insert covers human-booked appointments the store has never seen;\n-- the conflict arm only ever refreshes status fields, never booked_by.\nINSERT INTO appointments\n  (appointment_id, location_id, contact_id, booked_by, booked_at,\n   starts_at, status, status_at, synced_at)\nSELECT r->>'appointment_id',\n       $2,\n       NULL,\n       r->>'booked_by',\n       NULLIF(r->>'booked_at', '')::timestamptz,\n       (r->>'starts_at')::timestamptz,\n       r->>'status',\n       NULLIF(r->>'status_at', '')::timestamptz,\n       now()\nFROM jsonb_array_elements($1::jsonb) AS r\nON CONFLICT (appointment_id) DO UPDATE\n   SET status    = EXCLUDED.status,\n       status_at = EXCLUDED.status_at,\n       synced_at = now();",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify([JSON.stringify($json.rows), $env.DEFAULT_LOCATION_ID || 'demo-location']) }}"
+        }
+      },
+      "id": "sync-0006",
+      "name": "Sync statuses into appointments",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [-540, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Yesterday, through the console's own lens: what the agent handled,\n-- what it cost, and what a human had to take. Empty is a signal, not a\n-- zero -- a day with no calls is either a broken integration or a quiet\n-- day, and this line exists so somebody notices which.\nSELECT day, calls, booked, escalated, messages, abandoned,\n       book_rate_pct, containment_pct, avg_secs, cost_usd, cost_per_booking_usd\nFROM v_call_outcomes\nWHERE location_id = $1\n  AND day = (current_date - 1)\nORDER BY day;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify([$env.DEFAULT_LOCATION_ID || 'demo-location']) }}"
+        }
+      },
+      "id": "metrics-0007",
+      "name": "Yesterday's call outcomes",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [-320, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The comparison this whole system exists to make honest. Only past\n-- appointments count, and the split is published even when it flatters a\n-- human -- burying an unflattering number makes every other one suspect.\nSELECT booked_by, appointments, attended, no_shows, cancelled, show_rate_pct\nFROM v_show_rate_by_booker\nWHERE location_id = $1\nORDER BY booked_by;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify([$env.DEFAULT_LOCATION_ID || 'demo-location']) }}"
+        }
+      },
+      "id": "showrate-0008",
+      "name": "Show rate by booker",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [-100, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// One morning line, built to be read on a phone. The show-rate split is\n// published whether it flatters the agent or not -- that is the rule.\n\nconst outcomes = $('Yesterday\\'s call outcomes').first().json;\nconst rates = $('Show rate by booker').all().map(r => r.json);\n\nconst hasOutcomes = outcomes && outcomes.day !== undefined && outcomes.day !== null;\nconst dayLine = hasOutcomes\n  ? '*Yesterday* — ' + outcomes.calls + ' calls · ' + outcomes.booked + ' booked · ' +\n    outcomes.escalated + ' escalated · ' + outcomes.containment_pct + '% contained' +\n    (outcomes.cost_per_booking_usd ? ' · $' + Number(outcomes.cost_per_booking_usd).toFixed(2) + '/booking' : '')\n  : '*Yesterday* — no call data recorded (broken integration or a quiet day)'; \n\nconst rateLine = rates.length\n  ? rates.map(r => {\n      const pct = r.show_rate_pct === null ? 'no resolved appointments' : Number(r.show_rate_pct).toFixed(1) + '%';\n      return '• *' + r.booked_by + '*-booked: ' + r.attended + '/' + r.appointments + ' attended (' + pct + ')';\n    }).join('\\n')\n  : '• No past appointments on record yet';\n\nreturn [{\n  json: {\n    text: '🌅 *Frontdesk morning summary*\\n\\n' + dayLine + '\\n\\n*Show rate (past appointments)*\\n' + rateLine\n  }\n}];"
+      },
+      "id": "compose-0009",
+      "name": "Compose the morning summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [120, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.text }) }}",
+        "options": {}
+      },
+      "id": "slack-0010",
+      "name": "Post the summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [340, 300]
+    }
+  ],
+  "connections": {
+    "2am nightly": {
+      "main": [[{ "node": "Ensure the location row", "type": "main", "index": 0 }]]
+    },
+    "Ensure the location row": {
+      "main": [[{ "node": "Agent-booked appointment ids", "type": "main", "index": 0 }]]
+    },
+    "Agent-booked appointment ids": {
+      "main": [[{ "node": "Fetch calendar bookings", "type": "main", "index": 0 }]]
+    },
+    "Fetch calendar bookings": {
+      "main": [[{ "node": "Merge and map statuses", "type": "main", "index": 0 }]]
+    },
+    "Merge and map statuses": {
+      "main": [[{ "node": "Sync statuses into appointments", "type": "main", "index": 0 }]]
+    },
+    "Sync statuses into appointments": {
+      "main": [[{ "node": "Yesterday's call outcomes", "type": "main", "index": 0 }]]
+    },
+    "Yesterday's call outcomes": {
+      "main": [[{ "node": "Show rate by booker", "type": "main", "index": 0 }]]
+    },
+    "Show rate by booker": {
+      "main": [[{ "node": "Compose the morning summary", "type": "main", "index": 0 }]]
+    },
+    "Compose the morning summary": {
+      "main": [[{ "node": "Post the summary", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

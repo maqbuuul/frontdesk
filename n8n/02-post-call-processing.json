@@ -1,0 +1,220 @@
+{
+  "name": "02 - Post-call processing",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "post-call",
+        "responseMode": "onReceived",
+        "responseData": "noData",
+        "options": {}
+      },
+      "id": "hook-postcall-0001",
+      "name": "Call ended (transport)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1480, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Six systems run here, in order, with retries -- the reason n8n exists in\n// frontdesk at all. Nothing in this workflow is on the call path.\n//\n// This node only normalises what the transport sent. The envelope is read\n// defensively: voice platforms (Vapi, Retell, LiveKit) each nest the call\n// object differently, and none of their shapes are worth trusting blindly.\n\nconst body = $input.first().json;\nconst flat = (v) => (typeof v === 'object' && v !== null ? v : {});\nconst str = (v) => (v === undefined || v === null ? '' : String(v).trim());\n\nconst call = flat(body.call || body.data);\nconst contact = flat(body.contact);\nconst location = flat(body.location);\n\nconst call_id = str(body.call_id || body.callId || body.id || call.id || call.call_id || '');\nconst location_id = str(body.location_id || body.locationId || location.id || location.locationId || '');\nconst contact_id = str(body.contact_id || body.contactId || contact.id || contact.contactId || '');\nconst from_phone = str(body.from_phone || body.from || body.caller_number || contact.phone || '');\nconst started_at = str(body.started_at || body.startTime || call.startedAt || call.started_at || '');\nconst ended_at = str(body.ended_at || body.endTime || call.endedAt || call.ended_at || new Date().toISOString());\nconst duration_secs = Number(body.duration_secs || call.durationSecs || call.duration || 0);\nconst recording_url = str(body.recording_url || body.recordingUrl || call.recordingUrl || '');\n\nconst transcript = Array.isArray(body.transcript)\n  ? body.transcript\n  : Array.isArray(call.transcript)\n    ? call.transcript\n    : [];\nconst transcript_text = transcript\n  .map(t => {\n    const role = str(t.role || t.speaker || 'caller');\n    const text = str(t.text || t.content || t.message || '');\n    const at = str(t.at || t.timestamp || '');\n    return (at ? at + ' ' : '') + role + ': ' + text;\n  })\n  .join('\\n');\n\nreturn [{\n  json: {\n    call_id,\n    location_id: location_id || call_id,\n    contact_id,\n    from_phone,\n    started_at: started_at || null,\n    ended_at,\n    duration_secs,\n    recording_url,\n    transcript,\n    transcript_text,\n    transcript_json: JSON.stringify(transcript),\n    has_transcript: transcript_text.trim().length > 0\n  }\n}];"
+      },
+      "id": "norm-0002",
+      "name": "Normalise the payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1260, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-transcript",
+              "leftValue": "={{ $json.has_transcript }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-transcript-0003",
+      "name": "Transcript to extract from?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-1040, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $env.POSTCALL_MODEL || 'claude-sonnet-4-5', max_tokens: 1024, system: 'You are the post-call analyst for a dental receptionist. Extract intent, outcome, sentiment and follow-up need FROM THE TRANSCRIPT ONLY. Never invent detail the call did not contain. If you are not sure, say so in the summary and set the field to null. Respond with JSON only: { summary: string, intent: string (booking|reschedule|cancel|question|escalation|other), outcome: string|null, escalated: boolean, needs_followup: boolean, sentiment: string (positive|neutral|negative|frustrated) }', messages: [{ role: 'user', content: $json.transcript_text }] }) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key", "value": "={{ $env.ANTHROPIC_API_KEY }}" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "anthropic-0004",
+      "name": "Claude — extract from transcript",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-820, 300],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Claude returns text; the prompt asks for strict JSON, but models drift.\n// This parses tolerantly and degrades to a skipped extraction rather than\n// passing half-parsed garbage downstream to be stored as truth.\n\nconst body = $input.first().json;\nconst raw = typeof body === 'string' ? body : JSON.stringify(body || {});\n\nlet parsed = null;\nconst statusCode = body.statusCode || body.status || body.error ? String(body.error ? 'error' : (body.statusCode || body.status)) : '';\n\n// Anthropic errors land here via neverError: { type: 'error', error: {...} }\nif (body && body.type === 'error') {\n  return [{ json: { processed: false, reason: 'anthropic error: ' + (body.error && body.error.message || statusCode) } }];\n}\n\nlet text = '';\nif (Array.isArray(body && body.content)) {\n  text = body.content.map(b => (b && b.type === 'text' ? b.text : '')).join('\\n');\n} else if (typeof (body && body.text) === 'string') {\n  text = body.text;\n}\n\nif (!text.trim()) {\n  return [{ json: { processed: false, reason: 'no text in model response' } }];\n}\n\nconst start = text.indexOf('{');\nconst end = text.lastIndexOf('}');\nif (start !== -1 && end > start) {\n  try { parsed = JSON.parse(text.slice(start, end + 1)); } catch (e) { parsed = null; }\n}\n\nif (!parsed) {\n  return [{ json: { processed: false, reason: 'model output was not parseable JSON' } }];\n}\n\nreturn [{\n  json: {\n    processed: true,\n    summary: String(parsed.summary || ''),\n    intent: String(parsed.intent || 'other'),\n    outcome: parsed.outcome ? String(parsed.outcome) : null,\n    escalated: parsed.escalated === true,\n    needs_followup: parsed.needs_followup === true,\n    sentiment: String(parsed.sentiment || 'neutral')\n  }\n}];"
+      },
+      "id": "extract-0005",
+      "name": "Parse the structured summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-600, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "extracted",
+              "leftValue": "={{ $json.processed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-extracted-0006",
+      "name": "Extraction ok?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-380, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- calls.location_id is a foreign key, so the location row must exist\n-- before the call can be stored. Idempotent: a location that already exists\n-- is left untouched (its real business hours and escalation number are not\n-- overwritten by the transport payload).\nINSERT INTO locations (location_id, business_name, timezone, calendar_id)\nVALUES ($1, COALESCE(NULLIF($2, ''), 'Unknown practice'), 'America/New_York', '')\nON CONFLICT (location_id) DO NOTHING;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify([$json.location_id || $('Normalise the payload').first().json.call_id, $('Normalise the payload').first().json.call_id]) }}"
+        }
+      },
+      "id": "loc-0007",
+      "name": "Ensure the location row",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [-360, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Idempotent on call_id: transports resend webhooks, so a retried run\n-- must not duplicate or clobber the row. Outcome is only ever written when\n-- the row is new -- a call that already booked must not be re-labelled\n-- 'escalated' because post-call processing ran after the booking.\nINSERT INTO calls\n  (call_id, location_id, transport, direction, from_phone,\n   started_at, ended_at, duration_secs, outcome,\n   transcript, recording_url, summary, intent)\nVALUES\n  ($1, $2, 'voice', 'inbound', NULLIF($3, ''),\n   NULLIF($4, '')::timestamptz, NULLIF($5, '')::timestamptz, NULLIF($6, 0),\n   NULLIF($7, ''),\n   NULLIF($8, '')::jsonb, NULLIF($9, ''), NULLIF($10, ''), NULLIF($11, ''))\nON CONFLICT (call_id) DO UPDATE\n  SET ended_at      = EXCLUDED.ended_at,\n      duration_secs = EXCLUDED.duration_secs,\n      transcript    = COALESCE(EXCLUDED.transcript, calls.transcript),\n      recording_url = COALESCE(EXCLUDED.recording_url, calls.recording_url),\n      summary       = COALESCE(EXCLUDED.summary, calls.summary),\n      intent        = COALESCE(EXCLUDED.intent, calls.intent),\n      synced_at     = now();",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify([$json.location_id || $('Normalise the payload').first().json.call_id, $json.location_id || $('Normalise the payload').first().json.call_id, $('Normalise the payload').first().json.from_phone, $('Normalise the payload').first().json.started_at, $('Normalise the payload').first().json.ended_at, $('Normalise the payload').first().json.duration_secs, $json.escalated ? 'escalated' : null, $('Normalise the payload').first().json.transcript_json, $('Normalise the payload').first().json.recording_url, $json.summary, $json.intent]) }}"
+        }
+      },
+      "id": "store-0008",
+      "name": "Append the event to the store",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [-140, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "noop-skip-0008",
+      "name": "Post-call skipped",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [-380, 460]
+    },
+    {
+      "parameters": {},
+      "id": "noop-notranscript-0009",
+      "name": "Nothing to extract",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [-1040, 460]
+    }
+  ],
+  "connections": {
+    "Call ended (transport)": {
+      "main": [[{ "node": "Normalise the payload", "type": "main", "index": 0 }]]
+    },
+    "Normalise the payload": {
+      "main": [[{ "node": "Transcript to extract from?", "type": "main", "index": 0 }]]
+    },
+    "Transcript to extract from?": {
+      "main": [
+        [{ "node": "Claude — extract from transcript", "type": "main", "index": 0 }],
+        [{ "node": "Nothing to extract", "type": "main", "index": 0 }]
+      ]
+    },
+    "Claude — extract from transcript": {
+      "main": [[{ "node": "Parse the structured summary", "type": "main", "index": 0 }]]
+    },
+    "Parse the structured summary": {
+      "main": [[{ "node": "Extraction ok?", "type": "main", "index": 0 }]]
+    },
+    "Extraction ok?": {
+      "main": [
+        [{ "node": "Ensure the location row", "type": "main", "index": 0 }],
+        [{ "node": "Post-call skipped", "type": "main", "index": 0 }]
+      ]
+    },
+    "Ensure the location row": {
+      "main": [[{ "node": "Append the event to the store", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

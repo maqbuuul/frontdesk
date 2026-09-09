@@ -1,0 +1,193 @@
+{
+  "name": "03 - Escalation router",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "escalation",
+        "responseMode": "onReceived",
+        "responseData": "noData",
+        "options": {}
+      },
+      "id": "hook-esc-0001",
+      "name": "Escalation (internal)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1120, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Called by the /api/tools/escalate endpoint (N8N_ESCALATION_WEBHOOK_URL)\n// with the envelope the tool already decided. What the caller was promised\n// (toldCaller) was written by the tool, not by a model -- that promise\n// depends on staffing and the hour, and it must not drift.\n\nconst body = $input.first().json;\nconst str = (v) => (v === undefined || v === null ? '' : String(v).trim());\n\nreturn [{\n  json: {\n    escalation_id: str(body.escalationId || body.escalation_id),\n    call_id: str(body.callId || body.call_id),\n    category: str(body.category || 'confused'),\n    urgency: str(body.urgency || 'today'),\n    summary: str(body.summary || '(no summary given)'),\n    caller_said: str(body.callerSaid || body.caller_said),\n    action: str(body.action || 'message_taken'),\n    told_caller: str(body.toldCaller || body.told_caller),\n    open_now: body.openNow === true || body.open_now === true\n  }\n}];"
+      },
+      "id": "norm-0002",
+      "name": "Normalise the envelope",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-900, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The escalation row was written by the tool BEFORE this webhook fired:\n-- a dropped escalation is the worst outcome in the system, so the record\n-- must not depend on the network. This node only enriches the envelope with\n-- the on-call number and the caller's number for routing.\nSELECT COALESCE(l.escalation_number, '') AS escalation_number,\n       COALESCE(l.business_name, '')     AS business_name,\n       COALESCE(c.from_phone, '')        AS caller_phone\nFROM escalations e\nLEFT JOIN locations l USING (location_id)\nLEFT JOIN calls c USING (call_id)\nWHERE e.escalation_id = $1::bigint;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify([$json.escalation_id || '0']) }}"
+        }
+      },
+      "id": "ctx-0003",
+      "name": "On-call number + context",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [-680, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// The routing table from docs/02-escalation-policy.md:\n//\n//   urgency            business hours      after hours\n//   now                warm transfer       message + SMS on-call\n//   today              message, flagged    queued for the morning\n//   next_business_day  message             message\n//\n// 'Message' here means the escalation row + the console queue (v_escalation_queue),\n// which the tool endpoint already wrote. This workflow owns the two things\n// that leave the building: the after-hours SMS to the on-call number, and the\n// Slack line. A warm transfer rides the voice transport, which is not wired\n// yet -- until it is, 'now' during business hours degrades to the queue plus\n// Slack, which is exactly what the escalate tool already told the caller\n// (toldCaller) it would do.\n\nconst env = $input.first().json;\nconst n = $('Normalise the envelope').first().json;\n\nconst urgency = ['now', 'today', 'next_business_day'].includes(n.urgency) ? n.urgency : 'today';\nconst escalation_number = env.escalation_number || '';\nconst caller_phone = env.caller_phone || '';\nconst business_name = env.business_name || 'the practice';\n\nconst afterHours = !n.open_now;\nconst needs_oncall_sms = urgency === 'now' && afterHours && escalation_number !== '';\nconst needs_slack = urgency === 'now' || urgency === 'today';\n\nconst hoursLine = afterHours ? 'after hours' : 'business hours';\nconst line = '• *' + business_name + '* — ' + urgency + ' (' + hoursLine + '): ' + n.summary;\nconst callerLine = caller_phone ? '\\n• Caller: ' + caller_phone : '';\nconst saidLine = '\\n• Caller was told: ' + n.told_caller;\n\nconst slack_text = '⚠️ *Escalation ' + urgency + '*\\n' + line + callerLine + saidLine;\nconst sms_text = 'URGENT escalation for ' + business_name + ': ' + n.summary + '. Caller: ' + caller_phone;\n\nreturn [{\n  json: {\n    escalation_id: n.escalation_id,\n    call_id: n.call_id,\n    category: n.category,\n    urgency,\n    action: n.action,\n    summary: n.summary,\n    after_hours: afterHours,\n    needs_oncall_sms,\n    needs_slack,\n    escalation_number,\n    caller_phone,\n    business_name,\n    slack_text,\n    sms_text\n  }\n}];"
+      },
+      "id": "route-0004",
+      "name": "Route by urgency and hour",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "oncall-sms",
+              "leftValue": "={{ $json.needs_oncall_sms }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-sms-0005",
+      "name": "SMS the on-call number?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ONCALL_SMS_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ to: $json.escalation_number, text: $json.sms_text, escalationId: $json.escalation_id }) }}",
+        "options": {}
+      },
+      "id": "sms-0006",
+      "name": "SMS the on-call number",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-20, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "slack",
+              "leftValue": "={{ $json.needs_slack }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-slack-0007",
+      "name": "Post to Slack?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-20, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.slack_text }) }}",
+        "options": {}
+      },
+      "id": "slack-0008",
+      "name": "Post to Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [220, 400]
+    },
+    {
+      "parameters": {},
+      "id": "noop-queued-0009",
+      "name": "Queued in the console only",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [220, 560]
+    }
+  ],
+  "connections": {
+    "Escalation (internal)": {
+      "main": [[{ "node": "Normalise the envelope", "type": "main", "index": 0 }]]
+    },
+    "Normalise the envelope": {
+      "main": [[{ "node": "On-call number + context", "type": "main", "index": 0 }]]
+    },
+    "On-call number + context": {
+      "main": [[{ "node": "Route by urgency and hour", "type": "main", "index": 0 }]]
+    },
+    "Route by urgency and hour": {
+      "main": [[{ "node": "SMS the on-call number?", "type": "main", "index": 0 }]]
+    },
+    "SMS the on-call number?": {
+      "main": [
+        [{ "node": "SMS the on-call number", "type": "main", "index": 0 }],
+        [{ "node": "Post to Slack?", "type": "main", "index": 0 }]
+      ]
+    },
+    "SMS the on-call number": {
+      "main": [[{ "node": "Post to Slack?", "type": "main", "index": 0 }]]
+    },
+    "Post to Slack?": {
+      "main": [
+        [{ "node": "Post to Slack", "type": "main", "index": 0 }],
+        [{ "node": "Queued in the console only", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
