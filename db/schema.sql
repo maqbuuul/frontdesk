@@ -85,6 +85,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS slot_holds_live_idx
     ON slot_holds (slot_id)
     WHERE consumed_at IS NULL AND released_at IS NULL;
 
+-- The hold stops two callers being OFFERED the same time. This stops two
+-- bookings LANDING on it -- a hold can expire, a second transport can arrive,
+-- and a retry can replay a confirmation. Application logic that checks then
+-- inserts races with itself, so the database settles it: at most one booked
+-- appointment per slot per location, and the loser gets a constraint
+-- violation instead of a patient arriving to find the chair occupied.
+--
+-- Partial, so cancelled and completed rows do not hold the slot hostage.
+CREATE UNIQUE INDEX IF NOT EXISTS appointments_one_per_slot
+    ON appointments (location_id, starts_at)
+ WHERE status = 'booked';
+
 CREATE INDEX IF NOT EXISTS slot_holds_expiry_idx
     ON slot_holds (expires_at)
     WHERE consumed_at IS NULL AND released_at IS NULL;

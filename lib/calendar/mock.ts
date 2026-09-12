@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { issueSlotId } from '@/lib/slots';
+import { sql } from '@/lib/db';
 import type {
   Availability,
   AvailabilityQuery,
@@ -109,12 +110,46 @@ export class MockProvider implements CalendarProvider {
     return out;
   }
 
+  /**
+   * Times already taken.
+   *
+   * Cal.com and GoHighLevel keep their own calendar state and simply stop
+   * returning a slot once it is booked. The mock has no such store, so its
+   * state is our appointments table -- without this it cheerfully re-offers a
+   * time it booked a minute ago, the agent promises it, and the insert then
+   * fails on the unique index. Offering a slot that cannot be booked is a
+   * worse failure than having no slots.
+   */
+  private async takenStarts(locationId: string): Promise<Set<number>> {
+    try {
+      const rows = await sql()`
+        SELECT starts_at
+          FROM appointments
+         WHERE location_id = ${locationId}
+           AND status = 'booked'
+           AND starts_at > now()
+      `;
+      return new Set(rows.map((r: any) => new Date(r.starts_at).getTime()));
+    } catch {
+      // No database configured is a valid way to run the mock. Degrade to
+      // offering everything rather than refusing to answer the phone.
+      return new Set();
+    }
+  }
+
   async getAvailability(q: AvailabilityQuery): Promise<Availability> {
-    const slots = this.nextSlots(6).map((s) => ({
-      slotId: issueSlotId({ loc: q.locationId, st: s.startsAt, et: s.endsAt }),
-      startsAt: s.startsAt,
-      endsAt: s.endsAt,
-    }));
+    const taken = await this.takenStarts(q.locationId);
+
+    // Generate extra, because some will be filtered out.
+    const slots = this.nextSlots(12)
+      .filter((s) => !taken.has(new Date(s.startsAt).getTime()))
+      .slice(0, 6)
+      .map((s) => ({
+        slotId: issueSlotId({ loc: q.locationId, st: s.startsAt, et: s.endsAt }),
+        startsAt: s.startsAt,
+        endsAt: s.endsAt,
+      }));
+
     return { slots, timezone: this.tz(), nextAvailable: slots[0]?.startsAt };
   }
 

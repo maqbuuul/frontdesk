@@ -12,6 +12,11 @@ appointment — and knows which calls it has no business handling.**
 [![Tests](https://img.shields.io/badge/tests-17_passing-1c6b58)](test/run.mts)
 [![License](https://img.shields.io/badge/license-MIT-1c6b58)](LICENSE)
 
+**→ [frontdesk-murex.vercel.app](https://frontdesk-murex.vercel.app)** — a working
+console, running in demo mode. Book an appointment, then tell it your jaw hurts.
+
+![The console](docs/img/console.png)
+
 > **No paid keys?** Leave `ANTHROPIC_API_KEY` unset and it runs in **demo mode** —
 > rule-based booking over the same tools and the same signed slots, at zero cost.
 
@@ -51,6 +56,7 @@ flowchart TB
     end
 
     HOLDS[("slot_holds")]:::store
+    APPTS[("appointments")]:::store
     ESC[("escalations")]:::store
     CALLS[("calls")]:::store
     N8N["n8n · post-call<br/>escalation routing"]:::ext
@@ -63,7 +69,8 @@ flowchart TB
     DEMO --> tools
     T1 --> cal
     T3 --> cal
-    T2 -- "partial unique index<br/>stops the double-book" --> HOLDS
+    T2 -- "one live hold per slot<br/>stops two callers being offered it" --> HOLDS
+    T3 -- "one booked row per slot<br/>stops two landing on it" --> APPTS
     T3 --> HOLDS
     T4 --> ESC
     T4 -.-> N8N
@@ -92,6 +99,31 @@ where it cannot be argued with:
 | Signature | Slot ids carry an HMAC; `book_appointment` refuses any it did not issue |
 
 A model that invents a time produces a signature failure, not an appointment.
+
+## Two slots, two different races
+
+A hold and a booking fail in different ways, so the schema guards them
+separately — both with a partial unique index, because application logic that
+checks and then inserts races with itself.
+
+`slot_holds_live_idx` allows one *live* hold per slot: two callers cannot be
+offered the same time while one of them is still deciding.
+
+`appointments_one_per_slot` allows one *booked* row per slot per location. A
+hold expires, a second transport arrives, a confirmation gets retried — and the
+loser gets a constraint violation rather than a patient arriving to find the
+chair occupied. It is partial on `status = 'booked'` so a cancelled
+appointment does not hold the slot hostage.
+
+```
+second booking on the same slot   23505  appointments_one_per_slot
+a cancelled slot can be rebooked  ok
+```
+
+The mock calendar reads that table before it offers anything. Cal.com and GHL
+keep their own state and simply stop returning a booked slot; the mock has no
+such store, and offering a time that cannot be booked is a worse failure than
+having no times.
 
 ## Two more decisions worth defending
 
@@ -167,7 +199,7 @@ It escalates rather than books, and returns the sentence the *tool* chose.
 | ✅ | Signed slot ids, slot holds, six tool endpoints |
 | ✅ | The agent — prompt, tool schemas, loop, escalation short-circuit |
 | ✅ | Demo mode, 17 tests, typecheck, production build |
-| ⬜ | Console |
+| ✅ | Console — deployed, drives the real tool endpoints |
 | ⬜ | The five n8n workflows |
 
 ## Verified
